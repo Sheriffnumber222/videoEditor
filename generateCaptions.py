@@ -30,6 +30,7 @@ import shutil
 import tempfile
 import textwrap
 import subprocess
+import unicodedata
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -86,7 +87,18 @@ AUTO_DETECT_BARS = True
 CAPTION_CENTER_Y = None
 
 # Nudge the auto-computed center up (-) or down (+) by this many pixels.
-CAPTION_Y_OFFSET = 0
+# Default lifts captions a little for extra breathing room above the bottom
+# edge (the bottom is also where IG/Threads overlay their UI). Set to 0 for
+# dead-center in the bottom bar, or make it more negative to raise further.
+CAPTION_Y_OFFSET = -32
+
+# Keep the caption block at least this many pixels from the bottom edge and
+# from the bottom of the video content, so it never gets clipped or overlaps.
+CAPTION_SAFE_MARGIN = 64
+
+# Line height as a multiple of FONT_SIZE (used to size the caption block so it
+# fits inside the bottom bar without running off the canvas).
+LINE_HEIGHT_FACTOR = 1.25
 
 # Aspect ratio of the inner clip (used only when AUTO_DETECT_BARS is False).
 CLIP_ASPECT_W = 16
@@ -196,10 +208,13 @@ def detect_content_box(video: Path, width: int, height: int):
     Returns (x, y, w, h) of the inner clip, or None if detection fails.
     """
     try:
-        # Sample several seconds; cropdetect prints the strictest crop seen.
+        # Scan the whole clip at 2 fps. cropdetect (reset=0) accumulates the
+        # bounding box of all non-black content across every sampled frame, so
+        # the final crop is the union -- it won't shrink to a single frame where
+        # the subject happens to be small/dark. round=2 keeps dims even.
         result = subprocess.run(
             [FFMPEG, "-hide_banner", "-i", str(video),
-             "-t", "8", "-vf", "cropdetect=24:2:0", "-f", "null", "-"],
+             "-vf", "fps=2,cropdetect=24:2:0", "-f", "null", "-"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         crops = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", result.stderr)
@@ -235,11 +250,34 @@ def compute_caption_center_y(video: Path, width: int, height: int) -> int:
         print(f"  assuming centered {CLIP_ASPECT_W}:{CLIP_ASPECT_H} clip; "
               f"content bottom at y={content_bottom}")
 
-    if content_bottom >= height:  # no bottom bar found; sit near the bottom edge
-        center = height - FONT_SIZE
+    # Vertically center the *caption block* (not just a baseline) within the
+    # bottom black bar, then clamp so the block stays on-canvas and clear of the
+    # content. block_half uses the worst case (MAX_LINES) so 2-line captions fit.
+    block_half = (FONT_SIZE * LINE_HEIGHT_FACTOR * MAX_LINES) / 2
+    bar_top = min(content_bottom, height)
+    bar_height = height - bar_top
+
+    if bar_height < FONT_SIZE * LINE_HEIGHT_FACTOR:
+        # No real bottom bar detected (content runs to the edge). Sit just above
+        # the bottom safe margin rather than overlapping the very edge.
+        center = height - CAPTION_SAFE_MARGIN - block_half
+        print("  ! little/no bottom bar found; placing caption near bottom edge.")
     else:
-        center = (content_bottom + height) // 2
-    return center + CAPTION_Y_OFFSET
+        bar_center = (bar_top + height) / 2
+        # Allowed range for the block's center: below the content (+margin),
+        # and above the bottom edge (-margin).
+        lo = bar_top + CAPTION_SAFE_MARGIN + block_half
+        hi = height - CAPTION_SAFE_MARGIN - block_half
+        if lo > hi:
+            # Block taller than the usable bar; pin to the bottom safe area and
+            # warn -- a smaller FONT_SIZE would fit better.
+            center = hi
+            print(f"  ! caption block (~{int(block_half * 2)}px) is taller than the "
+                  f"bottom bar (~{int(bar_height)}px); consider a smaller FONT_SIZE.")
+        else:
+            center = max(lo, min(bar_center, hi))
+
+    return int(round(center)) + CAPTION_Y_OFFSET
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +325,7 @@ def transcribe(audio_path: Path):
 
     out = []
     for seg in segments_iter:
-        text = (seg.text or "").strip()
+        text = clean_segment_text(seg.text or "")
         if text:
             out.append({
                 "start": float(seg.start),
@@ -295,6 +333,23 @@ def transcribe(audio_path: Path):
                 "text": text,
             })
     return out
+
+
+def clean_segment_text(text: str) -> str:
+    """Tidy a raw whisper segment.
+
+    faster-whisper splits sentences across segments, so a segment often begins
+    with the leading whitespace/punctuation that joined it to the previous one
+    (e.g. ", Hey..." or the low-quote comma "‚Hey..."). Strip every leading
+    character that is punctuation (P*), a separator/space (Z*), a symbol (S*),
+    or invisible/control (C*) -- this catches all Unicode comma variants without
+    touching commas *inside* the sentence. Then collapse internal whitespace.
+    """
+    text = text.strip()
+    i = 0
+    while i < len(text) and unicodedata.category(text[i])[0] in ("P", "Z", "S", "C"):
+        i += 1
+    return " ".join(text[i:].split())
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +371,9 @@ def fmt_time(seconds: float) -> str:
 
 def wrap_caption(text: str) -> str:
     """Wrap to MAX_CHARS_PER_LINE / MAX_LINES, joined with ASS line breaks (\\N)."""
+    # Final safety net: strip leading-comma artifacts again right before render,
+    # in case text reached here from anywhere other than transcribe().
+    text = clean_segment_text(text)
     lines = textwrap.wrap(text, width=MAX_CHARS_PER_LINE) or [text]
     if len(lines) > MAX_LINES:
         # Re-wrap a little wider so it fits within MAX_LINES where possible.
@@ -345,7 +403,7 @@ Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour,
 Style: Caption,{FONT_NAME},{FONT_SIZE},{primary},{primary},{outline},&H00000000,{bold},0,0,0,100,100,0,0,1,{OUTLINE_WIDTH},{SHADOW_DEPTH},5,40,40,40,1
 
 [Events]
-Format: Layer, Start, End, Style, MarginL, MarginR, MarginV, Effect, Text
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
     # \an5 = anchor at the text block's center; \pos puts that center exactly
@@ -403,7 +461,7 @@ def main():
         print("extracting audio...")
         extract_audio(video, audio)
 
-        print("transcribing with OpenAI Whisper...")
+        print("transcribing locally with faster-whisper...")
         segments = transcribe(audio)
         print(f"  {len(segments)} caption segment(s)")
         if not segments:
